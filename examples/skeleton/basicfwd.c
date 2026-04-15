@@ -2,7 +2,7 @@
  * Copyright(c) 2010-2015 Intel Corporation
  */
 
-#include <stdint.h>
+#include <stdint.h> 
 #include <stdlib.h>
 #include <inttypes.h>
 #include <rte_eal.h>
@@ -10,6 +10,11 @@
 #include <rte_cycles.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
+#include <rte_ring.h>
+#include <rte_ip.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <signal.h>
 
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
@@ -26,8 +31,114 @@
  */
 
 /* Main functional part of port initialization. 8< */
-static inline int
-port_init(uint16_t port, struct rte_mempool *mbuf_pool)
+static uint64_t *ptr;
+static uint16_t rx_port = 0;
+static uint16_t tx_port = 1;
+struct rte_ring *rx_to_worker_ring;
+
+struct rte_ring *worker_to_tx_ring;
+
+struct rte_ring *rx_to_worker2_ring;
+struct rte_ring *worker2_to_tx_ring;
+static volatile uint32_t keep_running = 1;
+
+static struct port_stats {
+    uint64_t rx_packets;
+    uint64_t tx_packets;
+    uint64_t rx_bytes;
+    uint64_t tx_bytes;
+    uint64_t worker1_processed;
+    uint64_t worker2_processed;
+} stats[RTE_MAX_ETHPORTS];
+
+void sigint_handler(int sig) {
+    signal(SIGINT, SIG_DFL);
+    printf("\nCaught SIGINT, (Ctrl_C). Exiting...\n");
+    keep_running = 0;
+}
+
+static int rx_core(__rte_unused void*arg) {
+    struct rte_mbuf *bufs[BURST_SIZE];
+    while(keep_running) {
+        uint16_t nb_rx = rte_eth_rx_burst(rx_port, 0, bufs, BURST_SIZE);
+        if(nb_rx > 0) {
+            for(int i=0; i<nb_rx; i++) {
+            if(i&1) { 
+                rte_ring_enqueue(rx_to_worker_ring, bufs[i]);
+            } else {
+                rte_ring_enqueue(rx_to_worker2_ring, bufs[i]);
+            }
+            }
+            stats[rx_port].rx_packets += nb_rx;
+            for(int i=0; i<nb_rx; i++) {
+                stats[rx_port].rx_bytes += bufs[i]->pkt_len;
+            }
+        }
+    }
+    return 0;
+}
+
+static int worker_core(__rte_unused void *arg) {
+   struct rte_mbuf *bufs[BURST_SIZE];
+    while(keep_running) {
+        uint16_t nb_rx = rte_ring_dequeue_burst(rx_to_worker_ring, (void**)bufs, BURST_SIZE, NULL);
+ if(nb_rx == 0) continue;
+  for(int i=0; i<nb_rx; i++) {
+    struct rte_ipv4_hdr *ip = rte_pktmbuf_mtod_offset(bufs[i], struct rte_ipv4_hdr*, sizeof(struct rte_ether_hdr));
+    ip->time_to_live--;
+    }    
+ rte_ring_enqueue_burst(worker_to_tx_ring, (void**)bufs, nb_rx, NULL);
+                stats[rx_port].worker1_processed += nb_rx;
+    }
+    return 0;
+}
+
+static int worker_core2(__rte_unused void *arg) {
+   struct rte_mbuf *bufs[BURST_SIZE];
+    while(keep_running) {
+        uint16_t nb_rx = rte_ring_dequeue_burst(rx_to_worker2_ring, (void**)bufs, BURST_SIZE, NULL);
+ if(nb_rx == 0) continue;
+  for(int i=0; i<nb_rx; i++) {
+    struct rte_ipv4_hdr *ip = rte_pktmbuf_mtod_offset(bufs[i], struct rte_ipv4_hdr*, sizeof(struct rte_ether_hdr));
+    ip->time_to_live--;
+    }    
+ rte_ring_enqueue_burst(worker2_to_tx_ring, (void**)bufs, nb_rx, NULL);
+                stats[rx_port].worker2_processed += nb_rx;
+    }
+    return 0;
+}
+
+
+
+
+static int tx_core(__rte_unused void *arg){
+    struct rte_mbuf *bufs1[BURST_SIZE], *bufs2[BURST_SIZE];   
+    while(keep_running) {
+        uint16_t nb_rx1 = rte_ring_dequeue_burst(worker_to_tx_ring, (void**)bufs1, BURST_SIZE, NULL);
+        uint16_t nb_rx2 = rte_ring_dequeue_burst(worker2_to_tx_ring, (void**)bufs2, BURST_SIZE, NULL);
+        uint16_t nb_rx = nb_rx1 + nb_rx2;
+        if(nb_rx == 0) continue;
+         
+        struct rte_mbuf *tx_bufs[BURST_SIZE * 2];
+        int idx = 0;
+        for(int i=0; i<nb_rx1; i++) tx_bufs[idx++] = bufs1[i];
+        for(int i=0; i<nb_rx2; i++) tx_bufs[idx++] = bufs2[i]; 
+        uint16_t nb_tx =  rte_eth_tx_burst(tx_port, 0, tx_bufs, nb_rx);
+        stats[tx_port].tx_packets += nb_tx;
+        for(int i=0; i<nb_tx; i++) {
+        stats[tx_port].tx_bytes += tx_bufs[i]->pkt_len;
+    }
+    if(unlikely(nb_tx < nb_rx)) {
+        for (int i=nb_tx; i<nb_rx; i++) {
+            rte_pktmbuf_free(tx_bufs[i]);
+        }
+    }
+    }
+    return 0;
+}
+
+
+int port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 {
 	struct rte_eth_conf port_conf;
 	const uint16_t rx_rings = 1, tx_rings = 1;
@@ -113,56 +224,6 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
  */
 
  /* Basic forwarding application lcore. 8< */
-static __rte_noreturn void
-lcore_main(void)
-{
-	uint16_t port;
-
-	/*
-	 * Check that the port is on the same NUMA node as the polling thread
-	 * for best performance.
-	 */
-	RTE_ETH_FOREACH_DEV(port)
-		if (rte_eth_dev_socket_id(port) >= 0 &&
-				rte_eth_dev_socket_id(port) !=
-						(int)rte_socket_id())
-			printf("WARNING, port %u is on remote NUMA node to "
-					"polling thread.\n\tPerformance will "
-					"not be optimal.\n", port);
-
-	printf("\nCore %u forwarding packets. [Ctrl+C to quit]\n",
-			rte_lcore_id());
-
-	/* Main work of application loop. 8< */
-	for (;;) {
-		/*
-		 * Receive packets on a port and forward them on the paired
-		 * port. The mapping is 0 -> 1, 1 -> 0, 2 -> 3, 3 -> 2, etc.
-		 */
-		RTE_ETH_FOREACH_DEV(port) {
-
-			/* Get burst of RX packets, from first port of pair. */
-			struct rte_mbuf *bufs[BURST_SIZE];
-			const uint16_t nb_rx = rte_eth_rx_burst(port, 0,
-					bufs, BURST_SIZE);
-
-			if (unlikely(nb_rx == 0))
-				continue;
-
-			/* Send burst of TX packets, to second port of pair. */
-			const uint16_t nb_tx = rte_eth_tx_burst(port ^ 1, 0,
-					bufs, nb_rx);
-
-			/* Free any unsent packets. */
-			if (unlikely(nb_tx < nb_rx)) {
-				uint16_t buf;
-				for (buf = nb_tx; buf < nb_rx; buf++)
-					rte_pktmbuf_free(bufs[buf]);
-			}
-		}
-	}
-	/* >8 End of loop. */
-}
 /* >8 End Basic forwarding application lcore. */
 
 /*
@@ -173,9 +234,10 @@ int
 main(int argc, char *argv[])
 {
 	struct rte_mempool *mbuf_pool;
-	unsigned nb_ports;
+	uint16_t nb_ports;
 	uint16_t portid;
-
+    unsigned lcore_id = 0;
+    signal(SIGINT, sigint_handler);
 	/* Initializion the Environment Abstraction Layer (EAL). 8< */
 	int ret = rte_eal_init(argc, argv);
 	if (ret < 0)
@@ -187,9 +249,11 @@ main(int argc, char *argv[])
 
 	/* Check that there is an even number of ports to send/receive on. */
 	nb_ports = rte_eth_dev_count_avail();
-	if (nb_ports < 2 || (nb_ports & 1))
+	if (nb_ports < 2 || nb_ports & 1)
 		rte_exit(EXIT_FAILURE, "Error: number of ports must be even\n");
-
+	uint64_t per_port_count[nb_ports];
+	memset(per_port_count, 0, nb_ports * (sizeof(uint64_t)));
+	ptr = per_port_count;
 	/* Creates a new mempool in memory to hold the mbufs. */
 
 	/* Allocates mempool to hold the mbufs. 8< */
@@ -209,11 +273,48 @@ main(int argc, char *argv[])
 
 	if (rte_lcore_count() > 1)
 		printf("\nWARNING: Too many lcores enabled. Only 1 used.\n");
-
+    
+    rx_to_worker_ring = rte_ring_create("rx_to_worker", 1024, rte_socket_id(), 0);
+    if(rx_to_worker_ring == NULL) 
+        rte_exit(EXIT_FAILURE, "Cannot create rx_to_worker ring\n");
+        
+    worker_to_tx_ring = rte_ring_create("worker_to_tx", 1024, rte_socket_id(), 0);
+    if(worker_to_tx_ring == NULL)
+        rte_exit(EXIT_FAILURE, "Cannot create worker_to_tx ring\n");
 	/* Call lcore_main on the main core only. Called on single lcore. 8< */
-	lcore_main();
-	/* >8 End of called on single lcore. */
+    
+    rx_to_worker2_ring = rte_ring_create("rx_to_worker2", 1024, rte_socket_id(), 0);
+    if(rx_to_worker2_ring == NULL) 
+        rte_exit(EXIT_FAILURE, "Cannot create rx_to_worker2_ring\n");
+    
+    worker2_to_tx_ring = rte_ring_create("worker2_to_tx_ring", 1024, rte_socket_id(), 0);
+    if(worker2_to_tx_ring == NULL)
+        rte_exit(EXIT_FAILURE, "Cannot create worker2_to_tx_ring\n");
 
+    unsigned rx_lcore = rte_get_next_lcore(lcore_id++, 1, 0);
+    unsigned worker1_lcore = rte_get_next_lcore(lcore_id++, 1, 0);
+    unsigned worker2_lcore = rte_get_next_lcore(lcore_id++, 1, 0);
+    unsigned tx_lcore = rte_get_next_lcore(lcore_id++, 1, 0);
+ 
+    rte_eal_remote_launch(rx_core, NULL, rx_lcore);
+    rte_eal_remote_launch(worker_core, NULL, worker1_lcore);
+    rte_eal_remote_launch(worker_core2, NULL, worker2_lcore);
+    rte_eal_remote_launch(tx_core, NULL, tx_lcore); 
+	/* >8 End of called on single lcore. */        
+
+
+    
+    printf("Pipeline running. Press Ctrl+C to quit.\n"); 
+    while(keep_running) {
+        printf("%"PRIu64"packets received\n", stats[rx_port].rx_packets);
+        printf( "%"PRIu64"packets transmitted\n", stats[tx_port].tx_packets); 
+        printf( "%"PRIu64"bytes received\n", stats[rx_port].rx_bytes);
+        printf("%"PRIu64"bytes transmitted\n",  stats[tx_port].tx_bytes);
+        printf("%"PRIu64"packtes processed by the worker1\n", stats[rx_port].worker1_processed);
+        printf("%"PRIu64"packtes processed by the worker2\n", stats[rx_port].worker2_processed);
+
+        sleep(1); 
+    }
 	/* clean up the EAL */
 	rte_eal_cleanup();
 
